@@ -56,6 +56,131 @@ const refreshAccessToken = async (domain, hubId, tryCount) => {
 };
 
 /**
+ * Get recently modified meetings as 100 meeting per page
+ */
+const processMeetings = async (domain, hubId, q) => {
+  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
+  const lastPulledDate = new Date(account.lastPulledDates.meetings);
+  const now = new Date();
+
+  let hasMore = true;
+  const offsetObject = {};
+  const limit = 100;
+
+  while (hasMore) {
+    const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
+    const lastModifiedDateFilter = generateLastModifiedDateFilter(lastModifiedDate, now);
+    const searchObject = {
+      filterGroups: [lastModifiedDateFilter],
+      sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'ASCENDING' }],
+      properties: [
+        'hs_meeting_body',
+        'hs_timestamp',
+        'hs_meeting_title',
+        'hubspot_owner_id',
+        'hs_attendee_owner_ids', // To fetch Meeting Attendee IDs
+        'hs_meeting_location',
+        'hs_meeting_start_time',
+        'hs_meeting_end_time',
+        'hs_meeting_outcome',
+        'hs_activity_type'
+      ],
+      limit,
+      after: offsetObject.after
+    };
+
+    let searchResult = {};
+
+    let tryCount = 0;
+    while (tryCount <= 4) {
+      try {
+        searchResult = await hubspotClient.crm.objects.meetings.searchApi.doSearch(searchObject);
+        break;
+      } catch (err) {
+        tryCount++;
+
+        if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
+
+        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+      }
+    }
+
+    if (!searchResult) throw new Error('Failed to fetch meetings for the 4th time. Aborting.');
+
+    const data = searchResult?.results || [];
+    offsetObject.after = parseInt(searchResult?.paging?.next?.after);
+
+    console.log('fetch meeting batch');
+
+    for (const meeting of data) {
+      if (!meeting.properties) continue;
+      let owner_email = null;
+  
+      if (meeting.properties.hubspot_owner_id) {
+        try {
+          const contact = await hubspotClient.crm.owners.ownersApi.getById(meeting.properties.hubspot_owner_id);
+          owner_email = contact.email;
+        } catch (error) {
+          owner_email = '';
+        }
+      }
+      // Fetch contact emails for attendees
+      const attendeeIds = meeting.properties.hs_attendee_owner_ids ? JSON.parse(meeting.properties.hs_attendee_owner_ids) : [];
+      const attendeeEmails = [];
+      if (attendeeIds.length > 0) {
+        const batchReadInputs = attendeeIds.map((id) => ({ id }));
+        const attendeeDetails = await hubspotClient.apiRequest({
+          method: 'post',
+          path: '/crm/v3/objects/contacts/batch/read',
+          body: { inputs: batchReadInputs, properties: ['email'] }
+        });
+        // to get owner attendees info (email) but 'hs_attendee_owner_ids' is all null for test data.
+
+        const attendees = attendeeDetails?.results || [];
+        attendees.forEach((attendee) => {
+          if (attendee.properties?.email) {
+            attendeeEmails.push(attendee.properties.email);
+          }
+        });
+      }
+
+      const actionTemplate = {
+        includeInAnalytics: 0,
+        meetingProperties: {
+          meeting_id: meeting.id,
+          meeting_title: meeting.properties.hs_meeting_title,
+          meeting_start_time: meeting.properties.hs_meeting_start_time,
+          meeting_end_time: meeting.properties.hs_meeting_end_time,
+          meeting_attendee_emails: attendeeEmails,
+          meeting_contact_email: owner_email
+        },
+      };
+
+      const isCreated = !lastPulledDate || new Date(meeting.createdAt) > lastPulledDate;
+  
+      q.push({
+        actionName: isCreated ? 'Meeting Created' : 'Meeting Updated',
+        actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt) - 2000,
+        ...actionTemplate,
+      });
+    }
+
+    if (!offsetObject?.after) {
+      hasMore = false;
+      break;
+    } else if (offsetObject?.after >= 9900) {
+      offsetObject.after = 0;
+      offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
+    }
+  }
+
+  account.lastPulledDates.companies = now;
+  await saveDomain(domain);
+
+  return true;
+};
+
+/**
  * Get recently modified companies as 100 companies per page
  */
 const processCompanies = async (domain, hubId, q) => {
@@ -316,6 +441,13 @@ const pullDataFromHubspot = async () => {
       console.log('process companies');
     } catch (err) {
       console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
+    }
+
+    try {
+      await processMeetings(domain, account.hubId, q);
+      console.log('process meetings');
+    } catch (err) {
+      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processMeetings', hubId: account.hubId } });
     }
 
     try {
